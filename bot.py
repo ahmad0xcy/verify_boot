@@ -1,183 +1,155 @@
-# bot.py — Discord Verify Bot (DM-based)
+# bot.py — Channel-based verification (no DMs)
 import os
-import asyncio
-from typing import Optional
+from typing import Optional, Dict
 
 import discord
 from discord.ext import commands
 from dotenv import load_dotenv
 
-# ---- Load environment variables ----
+# -------- Load configuration --------
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 GUILD_ID = int(os.getenv("GUILD_ID", "0"))
 VERIFIED_ROLE_NAME = os.getenv("VERIFIED_ROLE", "Verified")
 VERIFY_PASSWORD = os.getenv("VERIFY_PASSWORD", "secret123")
+VERIFY_CHANNEL_NAME = os.getenv("VERIFY_CHANNEL", "verify")  # channel where flow happens
+MAX_ATTEMPTS = int(os.getenv("VERIFY_ATTEMPTS", "3"))
 
 if not TOKEN:
-    raise SystemExit("DISCORD_TOKEN is missing. Set it in your environment variables.")
+    raise SystemExit("DISCORD_TOKEN is missing.")
 
-# ---- Intents & bot setup ----
+# -------- Bot setup --------
 intents = discord.Intents.default()
-intents.members = True              # required to manage roles & on_member_join
-intents.message_content = True      # required to read DM messages
+intents.members = True
+intents.message_content = True
 
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
+# Track who is in a verification session (user_id -> attempts_left)
+pending_sessions: Dict[int, int] = {}
 
-# ---- Helpers ----
+
+# -------- Helpers --------
 async def ensure_verified_role(guild: discord.Guild) -> discord.Role:
-    """Get or create the Verified role."""
     role = discord.utils.get(guild.roles, name=VERIFIED_ROLE_NAME)
     if role:
         return role
-    # Create role if missing (requires Manage Roles permission)
-    role = await guild.create_role(name=VERIFIED_ROLE_NAME, mentionable=True, reason="Create verified role")
-    return role
+    # Create role if missing
+    return await guild.create_role(name=VERIFIED_ROLE_NAME, mentionable=True, reason="Create verified role")
 
 
-async def add_verified(member: discord.Member) -> bool:
-    """Add the Verified role to the given member. Returns True on success."""
-    guild = member.guild
-    role = await ensure_verified_role(guild)
-    # Bot's role must be ABOVE the target role
+async def add_verified(member: discord.Member) -> None:
+    role = await ensure_verified_role(member.guild)
     await member.add_roles(role, reason="Verification passed")
-    return True
 
 
-def is_dm(channel: discord.abc.Messageable) -> bool:
-    return isinstance(channel, discord.DMChannel)
+def is_verify_channel(channel: discord.abc.GuildChannel) -> bool:
+    return isinstance(channel, discord.TextChannel) and channel.name.lower() == VERIFY_CHANNEL_NAME.lower()
 
 
-# ---- Events ----
+# -------- Events --------
 @bot.event
 async def on_ready():
     print(f"✅ Logged in as {bot.user} (ID: {bot.user.id})")
-    if GUILD_ID:
-        print(f"ℹ️  Target guild: {GUILD_ID}; verified role name: {VERIFIED_ROLE_NAME}")
-    else:
-        print("⚠️  GUILD_ID is not set. The bot will try to resolve the guild via mutual guilds.")
+    print(f"ℹ️ Guild: {GUILD_ID or 'auto'} | Verify channel: #{VERIFY_CHANNEL_NAME} | Role: {VERIFIED_ROLE_NAME}")
 
 
 @bot.event
 async def on_member_join(member: discord.Member):
-    """Send the verification prompt to new members via DM."""
-    if member.bot:
-        return
-    try:
-        dm = await member.create_dm()
-        await dm.send(
-            "Hello! 👋\n"
-            "This server uses a password-based verification.\n"
-            f"Please reply with the password to get the **{VERIFIED_ROLE_NAME}** role."
-        )
-    except discord.Forbidden:
-        # DM is closed – optionally notify staff in a mod channel (not implemented)
-        pass
+    # Optional: Nudge newcomer in-channel if verify channel exists
+    channel = discord.utils.get(member.guild.text_channels, name=VERIFY_CHANNEL_NAME)
+    if channel:
+        try:
+            await channel.send(f"Welcome {member.mention}! Type **verify** to start verification.")
+        except discord.Forbidden:
+            pass
 
 
 @bot.event
 async def on_message(message: discord.Message):
-    """Handle DM messages: verify when the correct password is sent."""
-    # Ignore messages from the bot itself
+    # Ignore bot messages
     if message.author.bot:
         return
 
-    if is_dm(message.channel):
-        # User is messaging the bot in DMs
-        content = message.content.strip()
-        # Optional: ignore empty/very short messages
-        if not content:
-            return
+    # Only handle inside the verify channel
+    if not is_verify_channel(message.channel):
+        await bot.process_commands(message)
+        return
 
-        # Try to find the member in the target guild
-        target_guild: Optional[discord.Guild] = None
-        target_member: Optional[discord.Member] = None
+    guild: Optional[discord.Guild] = message.guild
+    if not guild:
+        await bot.process_commands(message)
+        return
 
-        if GUILD_ID:
-            target_guild = bot.get_guild(GUILD_ID)
+    # If user already has the verified role, ignore
+    verified_role = discord.utils.get(guild.roles, name=VERIFIED_ROLE_NAME)
+    if verified_role and isinstance(message.author, discord.Member) and verified_role in message.author.roles:
+        await message.add_reaction("✅")
+        return
 
-        # Fallback: detect the first mutual guild if GUILD_ID wasn't set
-        if not target_guild and message.author.mutual_guilds:
-            target_guild = message.author.mutual_guilds[0]
+    content = message.content.strip()
 
-        if not target_guild:
-            await message.channel.send("I couldn't find the target server. Please contact the moderators.")
-            return
+    # 1) User types the trigger word "verify"
+    if content.lower() == "verify":
+        pending_sessions[message.author.id] = MAX_ATTEMPTS
+        await message.reply(
+            "Please enter the **password** to verify.\n"
+            f"You have **{MAX_ATTEMPTS}** attempts.",
+            mention_author=True
+        )
+        return
 
-        target_member = target_guild.get_member(message.author.id)
-        if not target_member:
-            await message.channel.send("I couldn't find you in the server. Did you leave? Please re-join and try again.")
-            return
+    # 2) If user is in a session, treat next messages as password attempts
+    if message.author.id in pending_sessions:
+        # Try to delete the user's password message for privacy
+        try:
+            await message.delete()
+        except discord.Forbidden:
+            pass
+        except discord.HTTPException:
+            pass
 
-        # Compare password
+        attempts_left = pending_sessions.get(message.author.id, MAX_ATTEMPTS)
+
         if content == VERIFY_PASSWORD:
             try:
-                await add_verified(target_member)
-                await message.channel.send("✅ Verification successful! You now have access.")
+                member = guild.get_member(message.author.id)
+                if not member:
+                    await message.channel.send("I couldn't find your member record. Please re-join the server.")
+                    return
+                await add_verified(member)
+                await message.channel.send(f"{message.author.mention} ✅ Verified! Welcome 🎉")
             except discord.Forbidden:
                 await message.channel.send(
-                    "⚠️ I don't have permission to assign roles. Please tell an admin to move my role above the verified role."
+                    f"{message.author.mention} ⚠️ I can't assign roles. Please ask an admin to move my role **above** `{VERIFIED_ROLE_NAME}`."
                 )
-            except Exception as e:
-                await message.channel.send("❌ Something went wrong while assigning the role. Please contact staff.")
-                print(f"[verify-error] {repr(e)}")
+            finally:
+                pending_sessions.pop(message.author.id, None)
+            return
         else:
-            await message.channel.send("❌ Incorrect password. Please try again.")
+            attempts_left -= 1
+            if attempts_left <= 0:
+                pending_sessions.pop(message.author.id, None)
+                await message.channel.send(f"{message.author.mention} ❌ Incorrect password. No attempts left. Please contact a moderator.")
+            else:
+                pending_sessions[message.author.id] = attempts_left
+                await message.channel.send(
+                    f"{message.author.mention} ❌ Incorrect password. Attempts left: **{attempts_left}**.\n"
+                    "Type the password again."
+                )
+            return
 
-    # Allow other commands to be processed (e.g., !ping)
+    # If none of the above and user typed something else, lightly guide them
+    if content and content.lower() != "verify":
+        await message.reply("Type **verify** to start verification.", mention_author=True)
+
     await bot.process_commands(message)
 
 
-# ---- Commands ----
+# -------- Simple health command --------
 @bot.command(name="ping")
 async def ping(ctx: commands.Context):
-    """Simple health check."""
     await ctx.reply("Pong!", mention_author=False)
-
-
-@bot.command(name="help")
-async def help_cmd(ctx: commands.Context):
-    """Minimal help."""
-    await ctx.reply(
-        "Available commands:\n"
-        "• `!ping` – quick test.\n"
-        "Verification is handled in DMs: reply with the correct password to get verified.",
-        mention_author=False,
-    )
-
-
-# Slash command to nudge a user with a DM prompt (staff only)
-@bot.tree.command(name="manual_verify", description="Send a DM to the user asking for the password.")
-@discord.app_commands.describe(user="Member to verify")
-@discord.app_commands.checks.has_permissions(manage_roles=True)
-async def manual_verify(interaction: discord.Interaction, user: discord.Member):
-    if user.bot:
-        await interaction.response.send_message("Bots cannot be verified.", ephemeral=True)
-        return
-    try:
-        dm = await user.create_dm()
-        await dm.send(
-            "Hello! 👋\n"
-            "Please reply with the password to complete verification."
-        )
-        await interaction.response.send_message("Verification message sent via DM ✅", ephemeral=True)
-    except discord.Forbidden:
-        await interaction.response.send_message("I cannot DM this user (DMs disabled).", ephemeral=True)
-
-
-# Ensure the slash command is synced (especially useful when running on Railway)
-@bot.event
-async def setup_hook():
-    try:
-        if GUILD_ID:
-            guild = discord.Object(id=GUILD_ID)
-            bot.tree.copy_global_to(guild=guild)
-            await bot.tree.sync(guild=guild)
-        else:
-            await bot.tree.sync()
-    except Exception as e:
-        print(f"⚠️ Slash command sync failed: {e}")
 
 
 if __name__ == "__main__":
