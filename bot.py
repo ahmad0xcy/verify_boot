@@ -2,7 +2,7 @@
 from discord.ext import commands
 
 # جلسات التعيين: user_id -> {"stage": "ask_name"/"ask_team", "name": str}
-pending_nickname_sessions: Dict[int, Dict[str, str]] = {}
+pending_nickname_sessions: dict[int, dict[str, str]] = {}
 
 class NicknameSetup(commands.Cog):
     def __init__(self, bot: commands.Bot):
