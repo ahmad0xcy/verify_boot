@@ -149,14 +149,14 @@ async def on_message(message: discord.Message):
 
             thread = await create_user_thread(message.channel, message.author)
             sessions[message.author.id] = {
-                "state": "await_password",
+                "state": "await_name",
                 "attempts": MAX_ATTEMPTS,
                 "name": None,
                 "team": None,
                 "thread_id": thread.id,
             }
             await thread.send(
-                f"{message.author.mention} Please enter the **password** to verify. You have **{MAX_ATTEMPTS}** attempts."
+                f"{message.author.mention} Please type your **Name**."
             )
         else:
             # Light hint
@@ -182,24 +182,6 @@ async def on_message(message: discord.Message):
         # Step machine
         state = st.get("state")
         attempts_left = st.get("attempts", MAX_ATTEMPTS)
-
-        if state == "await_password":
-            if raw == VERIFY_PASSWORD:
-                st["state"] = "await_name"
-                await message.channel.send("✅ Password accepted. Please type your **Name**.")
-            else:
-                attempts_left -= 1
-                if attempts_left <= 0:
-                    sessions.pop(message.author.id, None)
-                    await message.channel.send("❌ Incorrect password. No attempts left. Please contact a moderator.")
-                    # Optionally archive thread soon
-                    await asyncio.sleep(3)
-                    with contextlib.suppress(discord.Forbidden, discord.HTTPException):
-                        await message.channel.edit(archived=True, locked=True)
-                else:
-                    st["attempts"] = attempts_left
-                    await message.channel.send(f"❌ Wrong password. Attempts left: **{attempts_left}**.")
-            return
 
         if state == "await_name":
             name = sanitize(raw)
